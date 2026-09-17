@@ -86,6 +86,42 @@ def fetch_empresas_obras():
 
 
 # --------------------------------------------------------------------------
+# SANITIZAÇÃO DO PARÂMETRO DE EMPRESA (evita erro 537 no fn_ListEmpObr)
+# --------------------------------------------------------------------------
+def sanitize_empresa_obra(codigos: list[str]) -> str:
+    """
+    Monta a string 'EmpresaObra' que é passada para fn_ListEmpObr(?, ',').
+
+    Algumas implementações dessa função em T-SQL usam CHARINDEX para achar
+    a vírgula e depois fazem LEFT(@str, posicao - 1). Se a string não tiver
+    NENHUMA vírgula (ex.: uma única empresa selecionada, tipo "1"),
+    CHARINDEX retorna 0 e o cálculo vira LEFT(@str, -1), gerando o erro:
+
+        Parâmetro de comprimento inválido passado para a função LEFT ou
+        SUBSTRING. (537)
+
+    Para contornar isso sem alterar a função no banco, garantimos que a
+    string sempre tenha pelo menos uma vírgula "sobrando" no final quando
+    há apenas um código. Isso é só um workaround client-side; o ideal é
+    corrigir a função fn_ListEmpObr para tratar CHARINDEX = 0 como
+    "string inteira, sem mais delimitador".
+    """
+    # remove vazios / nan / espaços
+    limpos = [c.strip() for c in codigos if c and str(c).strip().lower() != "nan"]
+
+    if not limpos:
+        limpos = ["1"]  # fallback de segurança, ajuste se necessário
+
+    texto = ",".join(limpos)
+
+    if "," not in texto:
+        # força um delimitador de sobra para não quebrar a função
+        texto += ","
+
+    return texto
+
+
+# --------------------------------------------------------------------------
 # MONTAGEM DA QUERY PRINCIPAL (a mesma lógica do SQL enviado, agora
 # com bind de parâmetros e com o filtro de Grupo_usr adicionado)
 # --------------------------------------------------------------------------
@@ -224,8 +260,10 @@ with st.sidebar:
     empresas_cod = [o.split(" - ")[0] for o in empresas_escolhidas]
     if not empresas_cod:
         empresas_cod = df_emp_obr["empresa"].astype(str).unique().tolist()
-    # fn_ListEmpObr recebe só os códigos de empresa (formato original)
-    empresa_obra = ",".join(empresas_cod) if empresas_cod else "1"
+
+    # fn_ListEmpObr recebe só os códigos de empresa (formato original),
+    # agora passando pela sanitização para evitar o erro 537
+    empresa_obra = sanitize_empresa_obra(empresas_cod)
 
     df_obras_filtro = df_emp_obr[df_emp_obr["empresa"].astype(str).isin(empresas_cod)]
     opcoes_obra = [
@@ -312,6 +350,14 @@ if gerar:
             st.session_state["pdf_bytes"] = None  # invalida PDF anterior
         except Exception as e:
             st.error(f"Erro ao consultar o banco: {e}")
+            # Painel de debug: mostra o SQL final e os parâmetros enviados,
+            # para facilitar identificar qual valor está quebrando a query
+            # (ex.: qual empresa_obra foi passada para fn_ListEmpObr).
+            with st.expander("Detalhes técnicos (debug)"):
+                st.write("**empresa_obra enviado:**", empresa_obra)
+                st.code(sql, language="sql")
+                st.write("**Parâmetros (na ordem):**")
+                st.write(params)
 
 
 # --------------------------------------------------------------------------
