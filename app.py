@@ -1,34 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-App Streamlit - Relatório de Permissões de Usuários (UAU)
------------------------------------------------------------
-- Consulta a base UAU (SQL Server) usando as credenciais em st.secrets
-- Permite filtrar por USUÁRIO (individual, manual ou "todos")
-  ou por CÓDIGO DE GRUPO (Grupo_usr), que seleciona automaticamente
-  todos os usuários e filtra pelo grupo.
-- Mostra o resultado agrupado por usuário (mesmo layout do relatório
-  original: "login - nome" + tabela Programa/Descrição/Obs/Emp-Obra/Atributo)
-- Gera um PDF com esse mesmo layout, que só fica disponível para
-  download depois que o usuário visualiza o relatório na tela.
-
-Configuração das credenciais (arquivo .streamlit/secrets.toml):
-
-    [uau]
-    server   = "34.95.193.32"
-    database = "UAU"
-    uid      = "automacoes.sistema"
-    pwd      = "Lcm@2025*"
-
-Dependências (requirements.txt):
-    streamlit
-    pandas
-    pyodbc
-    reportlab
-
-Obs: é necessário ter o driver ODBC "ODBC Driver 17 for SQL Server"
-(ou 18) instalado no ambiente onde o Streamlit roda.
-"""
-
 import io
 import datetime as dt
 
@@ -161,8 +131,8 @@ FROM (
     LEFT JOIN Programas ON Programas.Status_prg = 0
 ) BDperm
 INNER JOIN (
-    -- empresa_obra chega como pares "empresa-obra" separados por vírgula,
-    -- ex: "1-001,1-002,2-007" (ajuste aqui se fn_ListEmpObr espera outro formato)
+    -- fn_ListEmpObr recebe só códigos de EMPRESA separados por vírgula
+    -- (ex: "1,2") e devolve todas as obras dessas empresas.
     SELECT * FROM fn_ListEmpObr(?, ',')
 ) AS EmpObr
     ON BDperm.empresa = EmpObr.Empresa
@@ -181,10 +151,19 @@ def build_query(
     programa: str,
     status_usr: str,
     permissao: str,
+    obra_pares: list[tuple[str, str]] | None = None,
 ):
     """Monta o SQL final com parâmetros (bind) de acordo com os filtros."""
     sql = BASE_SELECT
     params: list = [empresa_obra]
+
+    if obra_pares:
+        # restringe a obras específicas (dentro das empresas já filtradas
+        # via fn_ListEmpObr); cada par é (empresa, obra)
+        cond = " OR ".join(["(BDperm.empresa = ? AND BDperm.obra = ?)"] * len(obra_pares))
+        sql += f" AND ({cond})"
+        for emp, obr in obra_pares:
+            params.extend([emp, obr])
 
     if modo == "Usuário" and usuarios_sel:
         placeholders = ",".join(["?"] * len(usuarios_sel))
@@ -243,18 +222,24 @@ with st.sidebar:
         else st.multiselect("Empresa", opcoes_empresa)
     )
     empresas_cod = [o.split(" - ")[0] for o in empresas_escolhidas]
+    if not empresas_cod:
+        empresas_cod = df_emp_obr["empresa"].astype(str).unique().tolist()
+    # fn_ListEmpObr recebe só os códigos de empresa (formato original)
+    empresa_obra = ",".join(empresas_cod) if empresas_cod else "1"
 
     df_obras_filtro = df_emp_obr[df_emp_obr["empresa"].astype(str).isin(empresas_cod)]
     opcoes_obra = [
         f"{r.empresa}-{r.obra} - {r.nome_obra}" for r in df_obras_filtro.itertuples()
     ]
     todas_obras = st.checkbox("Todas as obras", value=True)
-    obras_escolhidas = (
-        opcoes_obra if todas_obras
-        else st.multiselect("Obra (digite para filtrar)", opcoes_obra)
-    )
-    pares_empresa_obra = [o.split(" - ")[0] for o in obras_escolhidas]
-    empresa_obra = ",".join(pares_empresa_obra) if pares_empresa_obra else "1"
+    obra_pares: list[tuple[str, str]] = []
+    if not todas_obras:
+        obras_escolhidas = st.multiselect("Obra (digite para filtrar)", opcoes_obra)
+        for o in obras_escolhidas:
+            emp, obr = o.split(" - ")[0].split("-", 1)
+            obra_pares.append((emp, obr))
+    # se "todas as obras" -> obra_pares fica vazio -> não restringe obra,
+    # pega todas as obras das empresas selecionadas
 
     st.divider()
 
@@ -318,6 +303,7 @@ if gerar:
             programa=programa,
             status_usr=status_usr,
             permissao=permissao,
+            obra_pares=obra_pares,
         )
         try:
             with st.spinner("Consultando..."):
