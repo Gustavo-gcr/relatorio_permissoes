@@ -1,3 +1,34 @@
+# -*- coding: utf-8 -*-
+"""
+App Streamlit - Relatório de Permissões de Usuários (UAU)
+-----------------------------------------------------------
+- Consulta a base UAU (SQL Server) usando as credenciais em st.secrets
+- Permite filtrar por USUÁRIO (individual, manual ou "todos")
+  ou por CÓDIGO DE GRUPO (Grupo_usr), que seleciona automaticamente
+  todos os usuários e filtra pelo grupo.
+- Mostra o resultado agrupado por usuário (mesmo layout do relatório
+  original: "login - nome" + tabela Programa/Descrição/Obs/Emp-Obra/Atributo)
+- Gera um PDF com esse mesmo layout, que só fica disponível para
+  download depois que o usuário visualiza o relatório na tela.
+
+Configuração das credenciais (arquivo .streamlit/secrets.toml):
+
+    [uau]
+    server   = "34.95.193.32"
+    database = "UAU"
+    uid      = "automacoes.sistema"
+    pwd      = "Lcm@2025*"
+
+Dependências (requirements.txt):
+    streamlit
+    pandas
+    pyodbc
+    reportlab
+
+Obs: é necessário ter o driver ODBC "ODBC Driver 17 for SQL Server"
+(ou 18) instalado no ambiente onde o Streamlit roda.
+"""
+
 import io
 import datetime as dt
 
@@ -73,9 +104,9 @@ def fetch_empresas_obras():
     sql = """
         SELECT
             Empresas.Codigo_emp AS empresa,
-            Empresas.Nome_emp AS nome_empresa,
+            Empresas.Desc_emp AS nome_empresa,
             Obras.Cod_obr AS obra,
-            Obras.Nome_obr AS nome_obra,
+            Obras.Descr_obr AS nome_obra,
             Obras.UF_obr AS uf
         FROM Obras
         INNER JOIN Empresas ON Empresas.Codigo_emp = Obras.Empresa_obr
