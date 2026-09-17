@@ -65,6 +65,25 @@ def fetch_grupos():
     return run_query(sql)
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_empresas_obras():
+    """Lista de empresas/obras cadastradas, para seleção dinâmica
+    (evita digitar código manualmente). Ajuste os nomes de
+    tabela/coluna caso sejam diferentes no seu banco."""
+    sql = """
+        SELECT
+            Empresas.Codigo_emp AS empresa,
+            Empresas.Nome_emp AS nome_empresa,
+            Obras.Cod_obr AS obra,
+            Obras.Nome_obr AS nome_obra,
+            Obras.UF_obr AS uf
+        FROM Obras
+        INNER JOIN Empresas ON Empresas.Codigo_emp = Obras.Empresa_obr
+        ORDER BY Empresas.Codigo_emp, Obras.Cod_obr
+    """
+    return run_query(sql)
+
+
 # --------------------------------------------------------------------------
 # MONTAGEM DA QUERY PRINCIPAL (a mesma lógica do SQL enviado, agora
 # com bind de parâmetros e com o filtro de Grupo_usr adicionado)
@@ -111,6 +130,8 @@ FROM (
     LEFT JOIN Programas ON Programas.Status_prg = 0
 ) BDperm
 INNER JOIN (
+    -- empresa_obra chega como pares "empresa-obra" separados por vírgula,
+    -- ex: "1-001,1-002,2-007" (ajuste aqui se fn_ListEmpObr espera outro formato)
     SELECT * FROM fn_ListEmpObr(?, ',')
 ) AS EmpObr
     ON BDperm.empresa = EmpObr.Empresa
@@ -173,80 +194,81 @@ st.title("Relatório de Permissões de Usuários")
 with st.sidebar:
     st.header("Filtros")
 
-    empresa_obra = st.text_input(
-        "Empresa/Obra (fn_ListEmpObr)",
-        value="1",
-        help="Lista de empresas/obras separadas por vírgula, ex: 1,2,3",
+    # ---- Empresa / Obra (seleção dinâmica, sem digitar código) ----
+    st.subheader("Empresa / Obra")
+    try:
+        df_emp_obr = fetch_empresas_obras()
+    except Exception as e:
+        df_emp_obr = pd.DataFrame(columns=["empresa", "nome_empresa", "obra", "nome_obra", "uf"])
+        st.warning(f"Não foi possível carregar empresas/obras: {e}")
+
+    opcoes_empresa = [
+        f"{e} - {n}" for e, n in
+        df_emp_obr[["empresa", "nome_empresa"]].drop_duplicates().itertuples(index=False)
+    ]
+    todas_empresas = st.checkbox("Todas as empresas", value=True)
+    empresas_escolhidas = (
+        opcoes_empresa if todas_empresas
+        else st.multiselect("Empresa", opcoes_empresa)
     )
+    empresas_cod = [o.split(" - ")[0] for o in empresas_escolhidas]
 
-    programa = st.text_input("Programa (codPr)", value="%")
-    permissao = st.text_input("Permissão (nível)", value="%")
-
-    status_opcao = st.selectbox(
-        "Status do usuário", ["Todos", "Ativo", "Inativo"], index=0
+    df_obras_filtro = df_emp_obr[df_emp_obr["empresa"].astype(str).isin(empresas_cod)]
+    opcoes_obra = [
+        f"{r.empresa}-{r.obra} - {r.nome_obra}" for r in df_obras_filtro.itertuples()
+    ]
+    todas_obras = st.checkbox("Todas as obras", value=True)
+    obras_escolhidas = (
+        opcoes_obra if todas_obras
+        else st.multiselect("Obra (digite para filtrar)", opcoes_obra)
     )
-    status_map = {"Todos": "%", "Ativo": "A", "Inativo": "I"}
-    status_usr = status_map[status_opcao]
+    pares_empresa_obra = [o.split(" - ")[0] for o in obras_escolhidas]
+    empresa_obra = ",".join(pares_empresa_obra) if pares_empresa_obra else "1"
 
-    st.markdown("---")
-    st.subheader("Filtrar por")
+    st.divider()
 
-    modo = st.radio(
-        "Tipo de filtro",
-        ["Usuário", "Código de Grupo"],
-        horizontal=False,
-    )
+    # ---- Programa / Status / Permissão ----
+    c1, c2 = st.columns(2)
+    programa = c1.text_input("Programa", value="%")
+    permissao = c2.text_input("Permissão", value="%")
+    status_opcao = st.selectbox("Status do usuário", ["Todos", "Ativo", "Inativo"])
+    status_usr = {"Todos": "%", "Ativo": "A", "Inativo": "I"}[status_opcao]
+
+    st.divider()
+
+    # ---- Usuário ou Grupo ----
+    st.subheader("Usuários")
+    modo = st.radio("Filtrar por", ["Usuário", "Código de Grupo"], horizontal=True)
 
     usuarios_sel: list[str] = []
     grupos_sel: list[str] = []
 
     if modo == "Usuário":
-        selecionar_todos_usr = st.checkbox("Selecionar todos os usuários", value=True)
-
-        if not selecionar_todos_usr:
+        if not st.checkbox("Todos os usuários", value=True):
             try:
-                df_usuarios = fetch_usuarios()
-                opcoes = [f"{r.login} - {r.nome}" for r in df_usuarios.itertuples()]
+                opcoes = [f"{r.login} - {r.nome}" for r in fetch_usuarios().itertuples()]
             except Exception as e:
                 opcoes = []
-                st.warning(f"Não foi possível carregar a lista de usuários: {e}")
+                st.warning(f"Erro ao carregar usuários: {e}")
+            escolhidos = st.multiselect("Usuário (digite para filtrar)", opcoes)
+            manual = st.text_input("Ou logins manuais (vírgula)")
+            usuarios_sel = list(dict.fromkeys(
+                [o.split(" - ")[0].strip() for o in escolhidos]
+                + [u.strip() for u in manual.split(",") if u.strip()]
+            ))
+    else:
+        try:
+            opcoes_grupo = fetch_grupos()["grupo"].astype(str).tolist()
+        except Exception as e:
+            opcoes_grupo = []
+            st.warning(f"Erro ao carregar grupos: {e}")
+        grupos_sel = st.multiselect("Grupo (digite para filtrar)", opcoes_grupo)
+        manual_grupo = st.text_input("Ou grupos manuais (vírgula)")
+        grupos_sel = list(dict.fromkeys(
+            grupos_sel + [g.strip() for g in manual_grupo.split(",") if g.strip()]
+        ))
 
-            escolhidos = st.multiselect("Selecionar usuários cadastrados", opcoes)
-            escolhidos_login = [o.split(" - ")[0].strip() for o in escolhidos]
-
-            manual = st.text_area(
-                "Ou digite os logins separados por vírgula",
-                placeholder="ex: adriana, alecarla, joao.silva",
-            )
-            manual_login = [u.strip() for u in manual.split(",") if u.strip()]
-
-            usuarios_sel = list(dict.fromkeys(escolhidos_login + manual_login))
-        # se "selecionar todos" -> usuarios_sel fica vazio -> query não filtra por usuário
-
-    else:  # Código de Grupo
-        st.caption("Ao filtrar por grupo, todos os usuários são considerados automaticamente.")
-        modo_grupo = st.radio(
-            "Como informar o(s) grupo(s)",
-            ["Escolher da lista cadastrada", "Digitar manualmente"],
-            horizontal=False,
-        )
-
-        if modo_grupo == "Escolher da lista cadastrada":
-            try:
-                df_grupos = fetch_grupos()
-                opcoes_grupo = df_grupos["grupo"].astype(str).tolist()
-            except Exception as e:
-                opcoes_grupo = []
-                st.warning(f"Não foi possível carregar a lista de grupos: {e}")
-            grupos_sel = st.multiselect("Selecionar grupo(s) (Grupo_usr)", opcoes_grupo)
-        else:
-            manual_grupo = st.text_input(
-                "Digite o(s) código(s) de grupo separados por vírgula",
-                placeholder="ex: 008, 043, 042",
-            )
-            grupos_sel = [g.strip() for g in manual_grupo.split(",") if g.strip()]
-
-    st.markdown("---")
+    st.divider()
     gerar = st.button("Gerar relatório", type="primary", use_container_width=True)
 
 
