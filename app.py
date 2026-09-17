@@ -24,8 +24,7 @@ st.set_page_config(page_title="Permissões de Usuários - UAU", layout="wide")
 # --------------------------------------------------------------------------
 # CONEXÃO COM O BANCO (credenciais via st.secrets)
 # --------------------------------------------------------------------------
-@st.cache_resource(show_spinner=False)
-def get_connection():
+def _abrir_conexao():
     cfg = st.secrets["uau"]
     conn_str = (
         "DRIVER={ODBC Driver 17 for SQL Server};"
@@ -35,12 +34,43 @@ def get_connection():
         f"PWD={cfg['pwd']};"
         "TrustServerCertificate=yes;"
     )
-    return pyodbc.connect(conn_str, timeout=15)
+    conn = pyodbc.connect(conn_str, timeout=15)
+    # timeout de EXECUÇÃO da query (em segundos), separado do timeout de
+    # login acima.
+    conn.timeout = 300
+    return conn
+
+
+def _conexao_esta_quebrada(exc: Exception) -> bool:
+    """Detecta erros de conexão (rede/driver), diferentes de erros de SQL
+    (sintaxe, permissão, dados). Nesses casos vale a pena reconectar."""
+    sqlstate = getattr(exc, "args", [None])[0] if getattr(exc, "args", None) else None
+    return sqlstate in ("08S01", "08001", "08003", "08004", "HYT00", "HYT01")
 
 
 def run_query(sql: str, params: list | None = None) -> pd.DataFrame:
-    conn = get_connection()
-    return pd.read_sql(sql, conn, params=params or [])
+    """Abre uma conexão NOVA para cada consulta e fecha em seguida.
+
+    Antes o app usava uma única conexão global (@st.cache_resource) durante
+    toda a vida do processo. Isso funciona bem em rede estável, mas basta a
+    conexão cair uma vez (VPN, firewall, instabilidade, servidor reiniciando
+    — erro 08S01 "Communication link failure"/"connection reset") para que
+    TODAS as consultas seguintes falhem, mesmo as mais simples, até alguém
+    reiniciar o app manualmente.
+
+    Abrir/fechar uma conexão por consulta custa um pouco mais de tempo,
+    mas evita esse tipo de trava total, já que nunca fica uma conexão
+    "zumbi" presa em cache. Ainda assim, se a rede estiver instável na
+    hora exata da chamada, tentamos reconectar uma vez antes de desistir.
+    """
+    try:
+        with _abrir_conexao() as conn:
+            return pd.read_sql(sql, conn, params=params or [])
+    except pyodbc.Error as e:
+        if _conexao_esta_quebrada(e):
+            with _abrir_conexao() as conn:
+                return pd.read_sql(sql, conn, params=params or [])
+        raise
 
 
 # --------------------------------------------------------------------------
