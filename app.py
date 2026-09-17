@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import io
+import re
 import datetime as dt
 
 import pandas as pd
@@ -86,46 +87,66 @@ def fetch_empresas_obras():
 
 
 # --------------------------------------------------------------------------
-# SANITIZAÇÃO DO PARÂMETRO DE EMPRESA (evita erro 537 no fn_ListEmpObr)
+# SANITIZAÇÃO / VALIDAÇÃO DO PARÂMETRO DE EMPRESA
 # --------------------------------------------------------------------------
+# O parâmetro @tcList de fn_ListEmpObr é do tipo `text` (obsoleto). O driver
+# ODBC 17 faz SQLDescribeParam nesse parâmetro, lê o max_length de catálogo
+# (que para `text` é só o tamanho do ponteiro interno, reportado como 16) e
+# TRUNCA a string bindada para esse tamanho antes de enviar ao servidor.
+# Isso gera o erro 537 (LEFT/SUBSTRING com comprimento inválido) sempre que
+# a lista de códigos passa de ~16 caracteres — não tem relação com faltar
+# vírgula ou com a quantidade de empresas.
+#
+# Como não é possível alterar a função no banco (é criptografada / objeto
+# de fornecedor), a correção é parar de enviar esse valor como parâmetro
+# bindado (?) e embutir a string diretamente como literal no SQL. Como o
+# conteúdo é estritamente "dígitos separados por vírgula", validamos com
+# regex antes de embutir, o que elimina qualquer risco de injeção de SQL.
+_EMPRESA_OBRA_REGEX = re.compile(r"^[0-9]+(,[0-9]+)*,?$")
+
+
 def sanitize_empresa_obra(codigos: list[str]) -> str:
-    """
-    Monta a string 'EmpresaObra' que é passada para fn_ListEmpObr(?, ',').
-
-    Algumas implementações dessa função em T-SQL usam CHARINDEX para achar
-    a vírgula e depois fazem LEFT(@str, posicao - 1). Se a string não tiver
-    NENHUMA vírgula (ex.: uma única empresa selecionada, tipo "1"),
-    CHARINDEX retorna 0 e o cálculo vira LEFT(@str, -1), gerando o erro:
-
-        Parâmetro de comprimento inválido passado para a função LEFT ou
-        SUBSTRING. (537)
-
-    Para contornar isso sem alterar a função no banco, garantimos que a
-    string sempre tenha pelo menos uma vírgula "sobrando" no final quando
-    há apenas um código. Isso é só um workaround client-side; o ideal é
-    corrigir a função fn_ListEmpObr para tratar CHARINDEX = 0 como
-    "string inteira, sem mais delimitador".
-    """
-    # remove vazios / nan / espaços
+    """Monta a string 'EmpresaObra' que será embutida (como literal) na
+    chamada de fn_ListEmpObr(...)."""
     limpos = [c.strip() for c in codigos if c and str(c).strip().lower() != "nan"]
 
     if not limpos:
         limpos = ["1"]  # fallback de segurança, ajuste se necessário
 
+    # garante que são só números (remove qualquer coisa que não seja dígito)
+    limpos = [re.sub(r"\D", "", c) for c in limpos]
+    limpos = [c for c in limpos if c]
+
+    if not limpos:
+        limpos = ["1"]
+
     texto = ",".join(limpos)
 
     if "," not in texto:
-        # força um delimitador de sobra para não quebrar a função
+        # alguns ambientes dessa função tratam string sem vírgula de forma
+        # diferente internamente; manter um delimitador de sobra é inofensivo
         texto += ","
 
     return texto
 
 
+def validar_empresa_obra_literal(texto: str) -> str:
+    """Valida que a string só contém dígitos e vírgulas antes de embutí-la
+    como literal no SQL. Lança ValueError se houver qualquer caractere
+    fora desse padrão (proteção contra SQL Injection)."""
+    if not _EMPRESA_OBRA_REGEX.match(texto):
+        raise ValueError(
+            f"Valor de empresa/obra contém caracteres inválidos: {texto!r}"
+        )
+    return texto
+
+
 # --------------------------------------------------------------------------
 # MONTAGEM DA QUERY PRINCIPAL (a mesma lógica do SQL enviado, agora
-# com bind de parâmetros e com o filtro de Grupo_usr adicionado)
+# com bind de parâmetros — exceto @tcList, que é embutido como literal
+# validado — e com o filtro de Grupo_usr adicionado)
 # --------------------------------------------------------------------------
-BASE_SELECT = """
+BASE_SELECT_TEMPLATE = """
 SELECT *,
     CASE WHEN PermissaOBra = 0 THEN
         (CASE WHEN PermIndivi = 0 THEN PermiGrupo ELSE PermIndivi END)
@@ -169,7 +190,13 @@ FROM (
 INNER JOIN (
     -- fn_ListEmpObr recebe só códigos de EMPRESA separados por vírgula
     -- (ex: "1,2") e devolve todas as obras dessas empresas.
-    SELECT * FROM fn_ListEmpObr(?, ',')
+    --
+    -- IMPORTANTE: @tcList é `text` e o ODBC Driver 17 trunca esse
+    -- parâmetro quando bindado com `?` (ver comentário acima de
+    -- sanitize_empresa_obra). Por isso o valor é embutido AQUI como
+    -- literal já validado por regex (só dígitos e vírgulas), e não
+    -- como parâmetro `?`.
+    SELECT * FROM fn_ListEmpObr('{empresa_obra_literal}', ',')
 ) AS EmpObr
     ON BDperm.empresa = EmpObr.Empresa
    AND BDperm.obra = EmpObr.Obra
@@ -189,9 +216,14 @@ def build_query(
     permissao: str,
     obra_pares: list[tuple[str, str]] | None = None,
 ):
-    """Monta o SQL final com parâmetros (bind) de acordo com os filtros."""
-    sql = BASE_SELECT
-    params: list = [empresa_obra]
+    """Monta o SQL final. `empresa_obra` é validado e embutido como literal
+    (não é mais um parâmetro bindado) para evitar o truncamento do ODBC no
+    parâmetro `text` de fn_ListEmpObr. Todos os demais filtros continuam
+    usando bind normal (`?`)."""
+    empresa_obra_literal = validar_empresa_obra_literal(empresa_obra)
+
+    sql = BASE_SELECT_TEMPLATE.format(empresa_obra_literal=empresa_obra_literal)
+    params: list = []
 
     if obra_pares:
         # restringe a obras específicas (dentro das empresas já filtradas
@@ -262,7 +294,7 @@ with st.sidebar:
         empresas_cod = df_emp_obr["empresa"].astype(str).unique().tolist()
 
     # fn_ListEmpObr recebe só os códigos de empresa (formato original),
-    # agora passando pela sanitização para evitar o erro 537
+    # sanitizados para conter apenas dígitos/vírgulas
     empresa_obra = sanitize_empresa_obra(empresas_cod)
 
     df_obras_filtro = df_emp_obr[df_emp_obr["empresa"].astype(str).isin(empresas_cod)]
@@ -333,17 +365,17 @@ if gerar:
     if modo == "Código de Grupo" and not grupos_sel:
         st.error("Selecione ou digite ao menos um código de grupo.")
     else:
-        sql, params = build_query(
-            empresa_obra=empresa_obra,
-            modo=modo,
-            usuarios_sel=usuarios_sel,
-            grupos_sel=grupos_sel,
-            programa=programa,
-            status_usr=status_usr,
-            permissao=permissao,
-            obra_pares=obra_pares,
-        )
         try:
+            sql, params = build_query(
+                empresa_obra=empresa_obra,
+                modo=modo,
+                usuarios_sel=usuarios_sel,
+                grupos_sel=grupos_sel,
+                programa=programa,
+                status_usr=status_usr,
+                permissao=permissao,
+                obra_pares=obra_pares,
+            )
             with st.spinner("Consultando..."):
                 df = run_query(sql, params)
             st.session_state["df_resultado"] = df
@@ -352,12 +384,14 @@ if gerar:
             st.error(f"Erro ao consultar o banco: {e}")
             # Painel de debug: mostra o SQL final e os parâmetros enviados,
             # para facilitar identificar qual valor está quebrando a query
-            # (ex.: qual empresa_obra foi passada para fn_ListEmpObr).
             with st.expander("Detalhes técnicos (debug)"):
-                st.write("**empresa_obra enviado:**", empresa_obra)
-                st.code(sql, language="sql")
-                st.write("**Parâmetros (na ordem):**")
-                st.write(params)
+                st.write("**empresa_obra enviado (literal validado):**", empresa_obra)
+                try:
+                    st.code(sql, language="sql")
+                    st.write("**Parâmetros bindados (na ordem):**")
+                    st.write(params)
+                except NameError:
+                    st.write("A query não chegou a ser montada (falhou na validação).")
 
 
 # --------------------------------------------------------------------------
