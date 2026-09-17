@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 import io
-import re
 import datetime as dt
 
 import pandas as pd
@@ -100,8 +99,10 @@ def fetch_grupos():
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_empresas_obras():
     """Lista de empresas/obras cadastradas, para seleção dinâmica
-    (evita digitar código manualmente). Ajuste os nomes de
-    tabela/coluna caso sejam diferentes no seu banco."""
+    (evita digitar código manualmente). Traz direto de Empresas/Obras
+    (sem passar por fn_ListEmpObr) — o multiselect de "Obra" na barra
+    lateral já filtra client-side (via pandas) apenas as obras das
+    empresas selecionadas."""
     sql = """
         SELECT
             Empresas.Codigo_emp AS empresa,
@@ -116,67 +117,24 @@ def fetch_empresas_obras():
     return run_query(sql)
 
 
-# --------------------------------------------------------------------------
-# SANITIZAÇÃO / VALIDAÇÃO DO PARÂMETRO DE EMPRESA
-# --------------------------------------------------------------------------
-# O parâmetro @tcList de fn_ListEmpObr é do tipo `text` (obsoleto). O driver
-# ODBC 17 faz SQLDescribeParam nesse parâmetro, lê o max_length de catálogo
-# (que para `text` é só o tamanho do ponteiro interno, reportado como 16) e
-# TRUNCA a string bindada para esse tamanho antes de enviar ao servidor.
-# Isso gera o erro 537 (LEFT/SUBSTRING com comprimento inválido) sempre que
-# a lista de códigos passa de ~16 caracteres — não tem relação com faltar
-# vírgula ou com a quantidade de empresas.
-#
-# Como não é possível alterar a função no banco (é criptografada / objeto
-# de fornecedor), a correção é parar de enviar esse valor como parâmetro
-# bindado (?) e embutir a string diretamente como literal no SQL. Como o
-# conteúdo é estritamente "dígitos separados por vírgula", validamos com
-# regex antes de embutir, o que elimina qualquer risco de injeção de SQL.
-_EMPRESA_OBRA_REGEX = re.compile(r"^[0-9]+(,[0-9]+)*,?$")
-
-
-def sanitize_empresa_obra(codigos: list[str]) -> str:
-    """Monta a string 'EmpresaObra' que será embutida (como literal) na
-    chamada de fn_ListEmpObr(...)."""
-    limpos = [c.strip() for c in codigos if c and str(c).strip().lower() != "nan"]
-
-    if not limpos:
-        limpos = ["1"]  # fallback de segurança, ajuste se necessário
-
-    # garante que são só números (remove qualquer coisa que não seja dígito)
-    limpos = [re.sub(r"\D", "", c) for c in limpos]
-    limpos = [c for c in limpos if c]
-
-    if not limpos:
-        limpos = ["1"]
-
-    texto = ",".join(limpos)
-
-    if "," not in texto:
-        # alguns ambientes dessa função tratam string sem vírgula de forma
-        # diferente internamente; manter um delimitador de sobra é inofensivo
-        texto += ","
-
-    return texto
-
-
-def validar_empresa_obra_literal(texto: str) -> str:
-    """Valida que a string só contém dígitos e vírgulas antes de embutí-la
-    como literal no SQL. Lança ValueError se houver qualquer caractere
-    fora desse padrão (proteção contra SQL Injection)."""
-    if not _EMPRESA_OBRA_REGEX.match(texto):
-        raise ValueError(
-            f"Valor de empresa/obra contém caracteres inválidos: {texto!r}"
-        )
-    return texto
+def normaliza_codigos(codigos: list[str]) -> list[str]:
+    """Remove vazios/'nan'/espaços de uma lista de códigos, mantendo a
+    ordem e sem duplicar."""
+    limpos = [str(c).strip() for c in codigos if c is not None]
+    limpos = [c for c in limpos if c and c.lower() != "nan"]
+    return list(dict.fromkeys(limpos))
 
 
 # --------------------------------------------------------------------------
-# MONTAGEM DA QUERY PRINCIPAL (a mesma lógica do SQL enviado, agora
-# com bind de parâmetros — exceto @tcList, que é embutido como literal
-# validado — e com o filtro de Grupo_usr adicionado)
+# MONTAGEM DA QUERY PRINCIPAL
 # --------------------------------------------------------------------------
-BASE_SELECT_TEMPLATE = """
+# fn_ListEmpObr foi REMOVIDA da consulta. O filtro de empresa/obra agora é
+# feito direto no WHERE, usando os códigos que o usuário escolhe na barra
+# lateral (carregados direto de Empresas/Obras). Isso resolve de vez o
+# erro 537: o parâmetro @tcList dessa função é do tipo T-SQL `text`, e o
+# driver ODBC 17 trunca parâmetros bindados nesse tipo — o problema não
+# existe mais porque a função deixou de ser chamada.
+BASE_SELECT = """
 SELECT *,
     CASE WHEN PermissaOBra = 0 THEN
         (CASE WHEN PermIndivi = 0 THEN PermiGrupo ELSE PermIndivi END)
@@ -217,19 +175,6 @@ FROM (
     LEFT JOIN ObrUsr ON ObrUsr.Usr_uo = Usuarios.Login_usr
     LEFT JOIN Programas ON Programas.Status_prg = 0
 ) BDperm
-INNER JOIN (
-    -- fn_ListEmpObr recebe só códigos de EMPRESA separados por vírgula
-    -- (ex: "1,2") e devolve todas as obras dessas empresas.
-    --
-    -- IMPORTANTE: @tcList é `text` e o ODBC Driver 17 trunca esse
-    -- parâmetro quando bindado com `?` (ver comentário acima de
-    -- sanitize_empresa_obra). Por isso o valor é embutido AQUI como
-    -- literal já validado por regex (só dígitos e vírgulas), e não
-    -- como parâmetro `?`.
-    SELECT * FROM fn_ListEmpObr('{empresa_obra_literal}', ',')
-) AS EmpObr
-    ON BDperm.empresa = EmpObr.Empresa
-   AND BDperm.obra = EmpObr.Obra
 WHERE 1 = 1
 """
 
@@ -237,7 +182,7 @@ ORDER_BY = " ORDER BY usuario, BDperm.empresa, BDperm.obra"
 
 
 def build_query(
-    empresa_obra: str,
+    empresas_cod: list[str],
     modo: str,
     usuarios_sel: list[str],
     grupos_sel: list[str],
@@ -246,22 +191,30 @@ def build_query(
     permissao: str,
     obra_pares: list[tuple[str, str]] | None = None,
 ):
-    """Monta o SQL final. `empresa_obra` é validado e embutido como literal
-    (não é mais um parâmetro bindado) para evitar o truncamento do ODBC no
-    parâmetro `text` de fn_ListEmpObr. Todos os demais filtros continuam
-    usando bind normal (`?`)."""
-    empresa_obra_literal = validar_empresa_obra_literal(empresa_obra)
+    """Monta o SQL final com parâmetros (bind) de acordo com os filtros.
 
-    sql = BASE_SELECT_TEMPLATE.format(empresa_obra_literal=empresa_obra_literal)
+    Filtro de empresa/obra:
+    - Se `obra_pares` vier preenchido (o usuário desmarcou "Todas as obras"
+      e escolheu obras específicas), filtra por cada par (empresa, obra).
+    - Caso contrário, filtra só pelas empresas selecionadas
+      (`BDperm.empresa IN (...)`), trazendo todas as obras delas — sem
+      nenhuma chamada a fn_ListEmpObr.
+    """
+    sql = BASE_SELECT
     params: list = []
 
     if obra_pares:
-        # restringe a obras específicas (dentro das empresas já filtradas
-        # via fn_ListEmpObr); cada par é (empresa, obra)
         cond = " OR ".join(["(BDperm.empresa = ? AND BDperm.obra = ?)"] * len(obra_pares))
         sql += f" AND ({cond})"
         for emp, obr in obra_pares:
             params.extend([emp, obr])
+    elif empresas_cod:
+        placeholders = ",".join(["?"] * len(empresas_cod))
+        sql += f" AND BDperm.empresa IN ({placeholders})"
+        params.extend(empresas_cod)
+    # se nem obra_pares nem empresas_cod vierem preenchidos, não filtra por
+    # empresa/obra (pega tudo) — cenário improvável na prática, já que o
+    # combo de empresas sempre tem ao menos um valor default.
 
     if modo == "Usuário" and usuarios_sel:
         placeholders = ",".join(["?"] * len(usuarios_sel))
@@ -319,14 +272,13 @@ with st.sidebar:
         opcoes_empresa if todas_empresas
         else st.multiselect("Empresa", opcoes_empresa)
     )
-    empresas_cod = [o.split(" - ")[0] for o in empresas_escolhidas]
+    empresas_cod = normaliza_codigos([o.split(" - ")[0] for o in empresas_escolhidas])
     if not empresas_cod:
-        empresas_cod = df_emp_obr["empresa"].astype(str).unique().tolist()
+        empresas_cod = normaliza_codigos(df_emp_obr["empresa"].astype(str).unique().tolist())
 
-    # fn_ListEmpObr recebe só os códigos de empresa (formato original),
-    # sanitizados para conter apenas dígitos/vírgulas
-    empresa_obra = sanitize_empresa_obra(empresas_cod)
-
+    # Obras: filtradas dinamicamente (client-side, via pandas) para conter
+    # apenas as obras pertencentes às empresas selecionadas acima —
+    # sempre que a seleção de empresa muda, essa lista é recalculada.
     df_obras_filtro = df_emp_obr[df_emp_obr["empresa"].astype(str).isin(empresas_cod)]
     opcoes_obra = [
         f"{r.empresa}-{r.obra} - {r.nome_obra}" for r in df_obras_filtro.itertuples()
@@ -339,7 +291,7 @@ with st.sidebar:
             emp, obr = o.split(" - ")[0].split("-", 1)
             obra_pares.append((emp, obr))
     # se "todas as obras" -> obra_pares fica vazio -> não restringe obra,
-    # pega todas as obras das empresas selecionadas
+    # pega todas as obras das empresas selecionadas (via empresas_cod)
 
     st.divider()
 
@@ -397,7 +349,7 @@ if gerar:
     else:
         try:
             sql, params = build_query(
-                empresa_obra=empresa_obra,
+                empresas_cod=empresas_cod,
                 modo=modo,
                 usuarios_sel=usuarios_sel,
                 grupos_sel=grupos_sel,
@@ -415,13 +367,14 @@ if gerar:
             # Painel de debug: mostra o SQL final e os parâmetros enviados,
             # para facilitar identificar qual valor está quebrando a query
             with st.expander("Detalhes técnicos (debug)"):
-                st.write("**empresa_obra enviado (literal validado):**", empresa_obra)
+                st.write("**empresas_cod selecionadas:**", empresas_cod)
+                st.write("**obra_pares selecionados:**", obra_pares)
                 try:
                     st.code(sql, language="sql")
                     st.write("**Parâmetros bindados (na ordem):**")
                     st.write(params)
                 except NameError:
-                    st.write("A query não chegou a ser montada (falhou na validação).")
+                    st.write("A query não chegou a ser montada.")
 
 
 # --------------------------------------------------------------------------
