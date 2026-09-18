@@ -97,6 +97,30 @@ def fetch_grupos():
 
 
 @st.cache_data(ttl=600, show_spinner=False)
+def fetch_programas():
+    """Lista de programas (Prg_po) distintos cadastrados em ObrUsrPerm,
+    para alimentar o multiselect de "Programa" na barra lateral."""
+    sql = """
+        SELECT DISTINCT Prg_po
+        FROM ObrUsrPerm
+        ORDER BY Prg_po
+    """
+    return run_query(sql)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_niveis_permissao():
+    """Lista de níveis (Nivel_po) distintos cadastrados em ObrUsrPerm,
+    para alimentar o multiselect de "Permissão" na barra lateral."""
+    sql = """
+        SELECT DISTINCT Nivel_po
+        FROM ObrUsrPerm
+        ORDER BY Nivel_po
+    """
+    return run_query(sql)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
 def fetch_empresas_obras():
     """Lista de empresas/obras cadastradas, para seleção dinâmica
     (evita digitar código manualmente). Traz direto de Empresas/Obras
@@ -186,9 +210,9 @@ def build_query(
     modo: str,
     usuarios_sel: list[str],
     grupos_sel: list[str],
-    programa: str,
+    programa_sel: list[str],
     status_usr: str,
-    permissao: str,
+    permissao_sel: list[str],
     obra_pares: list[tuple[str, str]] | None = None,
 ):
     """Monta o SQL final com parâmetros (bind) de acordo com os filtros.
@@ -228,20 +252,27 @@ def build_query(
         sql += f" AND BDperm.GrupoUsuario IN ({placeholders})"
         params.extend(grupos_sel)
 
-    sql += " AND codPr LIKE ?"
-    params.append(programa)
+    if programa_sel:
+        placeholders = ",".join(["?"] * len(programa_sel))
+        sql += f" AND codPr IN ({placeholders})"
+        params.extend(programa_sel)
+    # se programa_sel vier vazio (nada selecionado no multiselect), não
+    # filtra por programa -> pega todos.
 
     sql += " AND usuarioStatus LIKE ?"
     params.append(status_usr)
 
-    sql += """ AND (
+    if permissao_sel:
+        placeholders = ",".join(["?"] * len(permissao_sel))
+        sql += f""" AND (
         CASE
             WHEN PermissaOBra = 0 THEN
                 CASE WHEN PermIndivi = 0 THEN PermiGrupo ELSE PermIndivi END
             ELSE PermissaOBra
         END
-    ) LIKE ?"""
-    params.append(permissao)
+    ) IN ({placeholders})"""
+        params.extend(permissao_sel)
+    # se permissao_sel vier vazio, não filtra por permissão -> pega todas.
 
     sql += ORDER_BY
     return sql, params
@@ -296,9 +327,23 @@ with st.sidebar:
     st.divider()
 
     # ---- Programa / Status / Permissão ----
-    c1, c2 = st.columns(2)
-    programa = c1.text_input("Programa", value="%")
-    permissao = c2.text_input("Permissão", value="%")
+    try:
+        opcoes_programa = fetch_programas()["Prg_po"].astype(str).tolist()
+    except Exception as e:
+        opcoes_programa = []
+        st.warning(f"Erro ao carregar programas: {e}")
+
+    try:
+        opcoes_permissao = fetch_niveis_permissao()["Nivel_po"].astype(str).tolist()
+    except Exception as e:
+        opcoes_permissao = []
+        st.warning(f"Erro ao carregar níveis de permissão: {e}")
+
+    # Multiselect dinâmico: nada selecionado = não filtra (traz todos),
+    # igual ao comportamento antigo do "%".
+    programa_sel = st.multiselect("Programa (vazio = todos)", opcoes_programa)
+    permissao_sel = st.multiselect("Permissão (vazio = todas)", opcoes_permissao)
+
     status_opcao = st.selectbox("Status do usuário", ["Todos", "Ativo", "Inativo"])
     status_usr = {"Todos": "%", "Ativo": "A", "Inativo": "I"}[status_opcao]
 
@@ -353,9 +398,9 @@ if gerar:
                 modo=modo,
                 usuarios_sel=usuarios_sel,
                 grupos_sel=grupos_sel,
-                programa=programa,
+                programa_sel=programa_sel,
                 status_usr=status_usr,
-                permissao=permissao,
+                permissao_sel=permissao_sel,
                 obra_pares=obra_pares,
             )
             with st.spinner("Consultando..."):
